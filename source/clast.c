@@ -70,6 +70,8 @@ static int concat_if_new(void **list1, int num1, void *list2, int num2,
     int size);
 static int list_compare(const int *list1, int num1, const int *list2, int num2);
 
+static void unroll_jam (struct clast_stmt *s, struct clast_stmt *prev);
+static struct clast_stmt* clast_ast_dup(struct clast_stmt *s);
 struct clast_name *new_clast_name(const char *name)
 {
     struct clast_name *n = malloc(sizeof(struct clast_name));
@@ -237,6 +239,8 @@ struct clast_for *new_clast_for(CloogDomain *domain, const char *it,
     f->UB = UB;
     f->body = NULL;
     f->parallel = CLAST_PARALLEL_NOT;
+    f->unroll = CLAST_UNROLL_NOT;
+    f->ufactor = 0;
     f->private_vars = NULL;
     f->reduction_vars = NULL;
     f->time_var_name = NULL;
@@ -2106,4 +2110,483 @@ void clast_filter(struct clast_stmt *node,
         free(loops_next);
         free(stmts_next);
     }
+}
+
+/******************************************************************************
+ *                        Unroll-Jam functions                                *
+ ******************************************************************************/
+
+/*
+* Unroll jam the AST. Update AST based on the loops that are
+* marked for unroll jamming.
+*/
+void clast_unroll_jam (struct clast_stmt *s)
+{
+    unroll_jam(s, NULL);
+}
+
+/* Updates the epilogue of the statement. The loop epilogue of the loop being
+ * unroll jammed is not marked parallel. However the inner loops can be marked
+ * parallel for omp or simd execution. THe LB of the epilogue is empty. The
+ * value of the iterator will be the fall through value of the loop iterator
+ * that is unroll jammed. */
+static void update_epilogue_for_unrolling (struct clast_stmt *s)
+{
+    struct clast_for *loop;
+    assert (CLAST_STMT_IS_A(s, stmt_for));
+    loop = (struct clast_for *)s;
+    if (loop->LB)
+        free_clast_expr(loop->LB);
+    /* This is the fall through of the unroll jammed loop. Hence we dont need a
+     * lower bound here. Just dont have the new definition of the iterator at
+     * the beginning. */
+    loop->LB = NULL;
+    /* The epilogue must not be unrolled. */
+    loop->unroll = CLAST_UNROLL_NOT;
+    /* This is not a vectorizable loop, OMP parallelization will not help as the
+     * number of iterations will be very small. */
+    loop->parallel = CLAST_PARALLEL_NOT;
+}
+
+
+/* Replaces the iterator in the expression with the new iterator expression
+ * after unroll jam. The new expression is given by (iter + uf). */
+static void replace_iter_in_expr(struct clast_expr * e, const char *iter,
+        cloog_int_t uf, struct clast_term *prev)
+{
+    struct clast_name *n;
+    struct clast_term *t;
+    struct clast_reduction *r, *new_r;
+    struct clast_binary *b;
+    struct clast_expr *new_n, *new_t;
+    int i;
+    if (!e)
+        return;
+    if (e->type == clast_expr_name) {
+        n = (struct clast_name *)e;
+        if (!strcmp (n->name, iter)) {
+            cloog_int_t one;
+            cloog_int_init(one);
+            cloog_int_set_si(one , 1);
+            new_n = &new_clast_name(iter)->expr;
+            new_t = &new_clast_term(one,new_n)->expr;
+            new_r = new_clast_reduction(clast_red_sum, 2);
+            new_r->elts[0] = new_t;
+            new_r->elts[1] = &new_clast_term(uf, NULL)->expr;
+            prev->var = &new_r->expr;
+            cloog_int_clear(one);
+            free_clast_expr(e);
+        }
+    } else if (e->type == clast_expr_term) {
+        t = (struct clast_term *)e;
+        if (t->var) {
+            replace_iter_in_expr(t->var, iter, uf, t);
+        }
+    } else if (e->type == clast_expr_red) {
+        r = (struct clast_reduction *)e;
+        for (i=0; i< r->n; i++) {
+            replace_iter_in_expr(r->elts[i], iter, uf, NULL);
+        }
+    } else {
+        assert (e->type == clast_expr_bin);
+        b = (struct clast_binary *)e;
+        replace_iter_in_expr(b->LHS, iter, uf, NULL);
+    }
+}
+
+/* Updates the iterator in a substitution of a user statement.  */
+static void update_iterator_in_substitution(struct clast_stmt* sub,
+        const char *iterator, cloog_int_t uf)
+{
+    struct clast_stmt *t;
+    struct clast_expr *iter;
+    cloog_int_t uj_one;
+    cloog_int_init(uj_one);
+    cloog_int_set_si(uj_one, 1);
+
+    for (t = sub; t; t = t->next) {
+        assert (CLAST_STMT_IS_A(t, stmt_ass));
+        iter = ((struct clast_assignment *)t)->RHS;
+        replace_iter_in_expr(iter, iterator, uf, NULL);
+    }
+    cloog_int_clear(uj_one);
+}
+
+/* Returns the statements in a loop body that are at the same nesting depth as
+ * the statement s. The ordering of these statements has to be preserved during
+ * unroll jam. */
+static struct clast_stmt **get_statements_to_be_unrolled(struct clast_stmt *s,
+        int *num_unroll_stmts)
+{
+    int num, i;
+    struct clast_stmt ** unroll_stmts;
+    struct clast_stmt *stmt;
+    stmt = s;
+    num = 0;
+    /* All 'user' statements that are in the same level as the stmt s need to be
+     * unrolled. The order in which they are added to unroll_stmts is important.
+     * They should be added in order as the input. Unroll jamming will preserve
+     * this order. */
+    while ((stmt != NULL) && CLAST_STMT_IS_A(stmt, stmt_user)) {
+        num++;
+        stmt = stmt->next;
+    }
+    assert (num >= 1);
+    stmt = s;
+    unroll_stmts = (struct clast_stmt **)malloc (num * sizeof(struct clast_stmt *));
+    for (i=0; i<num; i++) {
+        unroll_stmts[i] = stmt;
+        stmt = stmt->next;
+    }
+    *num_unroll_stmts = num;
+    return unroll_stmts;
+}
+
+/* Unroll jams a statement. Current supports unroll jam of a single statement as
+ * opposed to a statement block. */
+static void unroll_jam_statement(struct clast_stmt *s, unsigned ufactor,
+        const char *uj_iterator, cloog_int_t stride)
+{
+    struct clast_user_stmt *in;
+    struct clast_stmt *curr, *prev, *last, *sub, **unroll_stmts;
+    int num_unroll_stmts, i, j;
+
+    assert(CLAST_STMT_IS_A(s, stmt_user));
+    unroll_stmts = get_statements_to_be_unrolled(s, &num_unroll_stmts);
+    last = unroll_stmts[num_unroll_stmts-1];
+    prev = last;
+    struct clast_stmt *out = last->next;
+    for (i = 1; i < ufactor; i++) {
+        /* The new unroll offset is i*loop_stride */
+        cloog_int_t uf;
+        cloog_int_init(uf);
+        cloog_int_set_si(uf, i);
+        /* Updated access is (iterator + (i*stride)). Compute i*stride first. */
+        cloog_int_mul(uf, uf, stride);
+        for (j = 0; j < num_unroll_stmts; j++) {
+            in = (struct clast_user_stmt *)unroll_stmts[j];
+            sub = clast_ast_dup(in->substitutions);
+            update_iterator_in_substitution(sub, uj_iterator, uf);
+            curr = &new_clast_user_stmt(in->domain, in->statement, sub)->stmt;
+            prev->next = curr;
+            prev = curr;
+        }
+        cloog_int_clear(uf);
+    }
+    prev->next = out;
+    free(unroll_stmts);
+}
+
+/* Updates stride of an unroll jammed loop. The new stride is given
+ * by unroll (factor * loop stride). */
+static void update_loop_stride_for_unrolling(struct clast_for *loop)
+{
+    int ufactor;
+    cloog_int_t uf;
+    ufactor = loop->ufactor;
+    cloog_int_init(uf);
+    cloog_int_set_si(uf, ufactor);
+    cloog_int_mul(loop->stride, loop->stride, uf);
+    cloog_int_clear(uf);
+}
+
+/* Unroll jams a loop body. */
+static void unroll_jam_loop_body(struct clast_stmt *s, int ufactor,
+        const char *iterator, cloog_int_t stride)
+{
+    struct clast_for *loop;
+    struct clast_guard *g;
+    struct clast_stmt *next_stmt;
+    if (!s)
+        return;
+    if (CLAST_STMT_IS_A(s, stmt_user)) {
+        next_stmt = s->next;
+        while (next_stmt) {
+            if (!CLAST_STMT_IS_A(next_stmt, stmt_user)) {
+                break;
+            }
+            next_stmt = next_stmt->next;
+        }
+        unroll_jam_statement(s, ufactor, iterator, stride);
+        unroll_jam_loop_body(next_stmt, ufactor, iterator, stride);
+    } else if (CLAST_STMT_IS_A(s, stmt_for)) {
+        loop = (struct clast_for *)s;
+        unroll_jam_loop_body(loop->body, ufactor, iterator, stride);
+        unroll_jam_loop_body(s->next, ufactor, iterator, stride);
+    } else if (CLAST_STMT_IS_A (s, stmt_guard)){
+        g = (struct clast_guard *)s;
+        unroll_jam_loop_body(g->then, ufactor, iterator, stride);
+        unroll_jam_loop_body(s->next, ufactor, iterator, stride);
+    }
+    return;
+}
+
+/* Updates the loop upper bound during unroll jam. The new upper bound is
+ * given by (UB - (unroll factor-1)* loop stride) where UB is the upper bound
+ * of the original loop. */
+static void update_loop_upper_bound_for_unrolling (struct clast_for *loop)
+{
+    cloog_int_t i, j;
+    struct clast_expr *new_term1, *new_term2;
+    struct clast_reduction *new_ub;
+
+    cloog_int_init(i);
+    cloog_int_init(j);
+    cloog_int_set_si(i,1);
+    cloog_int_sub(j, loop->stride, i);
+    cloog_int_neg(j,j);
+    new_term1 = &(new_clast_term(j, NULL))->expr;
+    new_term2 = &(new_clast_term(i, loop->UB))->expr;
+    new_ub = new_clast_reduction(clast_red_sum, 2);
+    new_ub->elts[0] = new_term2;
+    new_ub->elts[1] = new_term1;
+    loop->UB = &new_ub->expr;
+    cloog_int_clear(i);
+    cloog_int_clear(j);
+}
+
+/* Unroll jam a loop given by the ast node s. */
+static void unroll_jam_loop(struct clast_stmt *s)
+{
+    struct clast_for *loop;
+    assert (CLAST_STMT_IS_A(s, stmt_for));
+    loop = (struct clast_for *)s;
+    unroll_jam_loop_body(loop->body, loop->ufactor, loop->iterator,
+            loop->stride);
+    update_loop_stride_for_unrolling(loop);
+    update_loop_upper_bound_for_unrolling(loop);
+}
+
+/* Recursively checks whether an expression e contains the string given by
+ * iterator. Returns true if iterator is present. Else returns false. */
+static int does_expr_contain(struct clast_expr *e, const char* iterator)
+{
+    struct clast_name *n;
+    struct clast_term *t;
+    struct clast_binary *b;
+    struct clast_reduction *r;
+    int i;
+    if (!e)
+        return 0;
+    if (e->type == clast_expr_name) {
+        n = (struct clast_name *)e;
+        return (strcmp(n->name, iterator)?0:1);
+    }
+    if (e->type == clast_expr_term) {
+        t = (struct clast_term *)e;
+        return does_expr_contain(t->var, iterator);
+    }
+    if (e->type == clast_expr_bin) {
+        b = (struct clast_binary *)e;
+        return does_expr_contain(b->LHS, iterator);
+    }
+    /* This has to be a reduction type. */
+    assert (e->type == clast_expr_red);
+    r = (struct clast_reduction *)e;
+    for (i=0; i<r->n; i++) {
+        if (does_expr_contain(r->elts[i], iterator))
+            return 1;
+    }
+    return 0;
+}
+
+/* Checks whether the LHS or RHS of on equation containts the string given
+ * by iterator. Returns 1 if the string is present else returns 0. */
+static int does_equation_contain(struct clast_equation *e, const char *iterator)
+{
+    return (does_expr_contain(e->LHS, iterator) ||
+            does_expr_contain(e->RHS, iterator));
+}
+
+/* Checks if a loop body is rectangular. Given a loop with iterator "iterator",
+ * the routine checks if the loop body given by s, has a nested loop or a
+ * conditional with "iterator" in its expression. That is, iterator of the loop
+ * that is being unroll jammed shouldnt appear in the loop bounds or the guard
+ * statements. If yes, then it returns true.  Else returns false. */
+static int is_domain_rectangular (struct clast_stmt *s, const char *iterator)
+{
+    struct clast_for *loop;
+    struct clast_guard *g;
+    if (!s)
+        return 1;
+    if (CLAST_STMT_IS_A(s, stmt_user))
+        return is_domain_rectangular(s->next, iterator);
+    if (CLAST_STMT_IS_A(s, stmt_ass))
+        return is_domain_rectangular(s->next, iterator);
+    if (CLAST_STMT_IS_A(s, stmt_for)) {
+        loop = (struct clast_for*)s;
+        if(does_expr_contain(loop->LB, iterator))
+            return 0;
+        if(does_expr_contain(loop->UB, iterator))
+            return 0;
+        if (!is_domain_rectangular(loop->body, iterator))
+            return 0;
+        return is_domain_rectangular(s->next, iterator);
+    }
+    /* Has to be a guard. */
+    assert(CLAST_STMT_IS_A(s, stmt_guard));
+    g = (struct clast_guard *)s;
+    for (int i=0; i<g->n; i++) {
+        if (does_equation_contain(&g->eq[i], iterator)
+                || does_equation_contain(&g->eq[i], iterator))
+            return 0;
+    }
+    if (!is_domain_rectangular(g->then, iterator))
+        return 0;
+    return is_domain_rectangular(s->next, iterator);
+}
+
+/* Routine recursives traverses the AST in a top down manner and unroll jams for
+ * loops that are marked with CLAST_UNROLL_JAM if the domain is rectangluar with
+ * respect to the loop that is being unroll jammed.   */
+static void unroll_jam (struct clast_stmt *s, struct clast_stmt *prev)
+{
+    struct clast_for *loop;
+    struct clast_stmt *epilogue, *tmp;
+    struct clast_guard *g;
+    if (!s)
+        return;
+    if (CLAST_STMT_IS_A(s, stmt_root)) {
+        prev = s;
+        s = s-> next;
+        unroll_jam (s, prev);
+    } else if (CLAST_STMT_IS_A(s, stmt_for)) {
+        loop = (struct clast_for*) s;
+        if (loop->unroll == CLAST_UNROLL_JAM) {
+            if (!is_domain_rectangular(loop->body, loop->iterator)) {
+                loop->unroll = CLAST_UNROLL_NOT;
+                unroll_jam (loop->body, s);
+                prev = s;
+                s = s->next;
+                unroll_jam (s, prev);
+                return;
+            }
+            epilogue = clast_ast_dup(s);
+            update_epilogue_for_unrolling(epilogue);
+            unroll_jam_loop(s);
+            tmp = s->next;
+            s->next = epilogue;
+            epilogue->next = tmp;
+            /* Unroll jam inner loops of an unroll jammed loop. This is to
+             * support multi-loop unroll jam. */
+            unroll_jam(loop->body, s);
+            return;
+        } else {
+            unroll_jam(loop->body, s);
+        }
+        prev = s;
+        s = s->next;
+        unroll_jam (s, prev);
+    } else if(CLAST_STMT_IS_A(s, stmt_guard)) {
+        g = (struct clast_guard *)s;
+        unroll_jam (g->then, s);
+        prev = s;
+        s = s->next;
+        unroll_jam(s, prev);
+    } else if (CLAST_STMT_IS_A(s, stmt_user) || CLAST_STMT_IS_A(s, stmt_ass)){
+        prev = s;
+        s = s->next;
+        unroll_jam (s, prev);
+    } else {
+        printf("Unkown statement found \n");
+        assert(0);
+    }
+}
+
+/* Duplicates a string. Returns NULL if the input string is NULL. */
+static char * clast_str_dup(const char *s)
+{
+    return (s ? strdup(s) : NULL);
+}
+
+/* Deep copy a for node in the AST. */
+static struct clast_for *clast_for_copy (struct clast_for *f)
+{
+    struct clast_expr *lb, *ub;
+    const char *new_iterator;
+    struct clast_for *new_for;
+
+    lb = clast_expr_copy(f->LB);
+    ub = clast_expr_copy(f->UB);
+    new_iterator = f->iterator;
+    new_for = new_clast_for(f->domain, new_iterator, lb, ub, NULL);
+    cloog_int_set(new_for->stride, f->stride);
+    new_for->parallel = f->parallel;
+    new_for->unroll = f->unroll;
+    new_for->ufactor = f->ufactor;
+    new_for->private_vars = clast_str_dup(f->private_vars);
+    new_for->reduction_vars = clast_str_dup(f->reduction_vars);
+    new_for->time_var_name = clast_str_dup(f->time_var_name);
+    new_for->user_directive = clast_str_dup(f->user_directive);
+    new_for->body = clast_ast_dup(f->body);
+    return new_for;
+}
+
+/* Deep copy an assignment statement. */
+static struct clast_assignment *clast_assignment_copy(struct clast_assignment *a)
+{
+    char *lhs;
+    struct clast_expr *rhs;
+    struct clast_assignment *new_a;
+    lhs = clast_str_dup(a->LHS);
+    rhs = clast_expr_copy(a->RHS);
+    new_a = new_clast_assignment(lhs, rhs);
+    return new_a;
+}
+
+/* Deep copy a user statement. */
+static struct clast_user_stmt *clast_user_stmt_copy(struct clast_user_stmt *u)
+{
+    struct clast_stmt *new_subs;
+    struct clast_user_stmt *new_u;
+    new_subs = clast_ast_dup(u->substitutions);
+    new_u = new_clast_user_stmt(u->domain, u->statement, new_subs);
+    return new_u;
+}
+
+/* Deep copy a guard statement. */
+static struct clast_guard * clast_guard_copy(struct clast_guard* g)
+{
+    int i;
+    struct clast_guard* new_g = new_clast_guard(g->n);
+    for (i = 0; i < g->n; i++) {
+        new_g->eq[i].LHS = clast_expr_copy(g->eq[i].LHS);
+        new_g->eq[i].RHS = clast_expr_copy(g->eq[i].RHS);
+        new_g->eq[i].sign = g->eq[i].sign;
+    }
+    new_g->then = clast_ast_dup(g->then);
+    return new_g;
+}
+
+/* Duplicates the entire AST rooted at s. Returns a deep copy of the
+ * AST under s. */
+static struct clast_stmt* clast_ast_dup(struct clast_stmt *s)
+{
+    struct clast_stmt *new_stmt;
+    struct clast_for *f;
+    struct clast_assignment *a;
+    struct clast_user_stmt *u;
+    struct clast_guard *g;
+    if (s == NULL)
+        return NULL;
+
+    if(CLAST_STMT_IS_A(s, stmt_for)) {
+        f = (struct clast_for *) s;
+        new_stmt = &clast_for_copy(f)->stmt;
+        new_stmt->next = clast_ast_dup(s->next);
+    } else if (CLAST_STMT_IS_A(s, stmt_ass)) {
+        a = (struct clast_assignment *) s;
+        new_stmt = &clast_assignment_copy(a)->stmt;
+        new_stmt->next = clast_ast_dup(s->next);
+    } else if (CLAST_STMT_IS_A(s, stmt_user)) {
+        u = (struct clast_user_stmt *) s;
+        new_stmt = &clast_user_stmt_copy(u)->stmt;
+        new_stmt->next = clast_ast_dup(s->next);
+    } else {
+        assert(CLAST_STMT_IS_A(s, stmt_guard));
+        g = (struct clast_guard *)s;
+        new_stmt = &clast_guard_copy(g)->stmt;
+        new_stmt->next = clast_ast_dup(s->next);
+    }
+    return new_stmt;
 }
