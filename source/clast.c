@@ -239,7 +239,7 @@ struct clast_for *new_clast_for(CloogDomain *domain, const char *it,
     f->UB = UB;
     f->body = NULL;
     f->parallel = CLAST_PARALLEL_NOT;
-    f->unroll = CLAST_UNROLL_NOT;
+    f->unroll_type = clast_no_unroll;
     f->ufactor = 0;
     f->private_vars = NULL;
     f->reduction_vars = NULL;
@@ -2142,7 +2142,7 @@ static void update_epilogue_for_unrolling (struct clast_stmt *s)
      * the beginning. */
     loop->LB = NULL;
     /* The epilogue must not be unrolled. */
-    loop->unroll = CLAST_UNROLL_NOT;
+    loop->unroll_type = clast_no_unroll;
     /* This is not a vectorizable loop, OMP parallelization will not help as the
      * number of iterations will be very small. */
     loop->parallel = CLAST_PARALLEL_NOT;
@@ -2184,7 +2184,7 @@ static void replace_iter_in_expr(struct clast_expr * e, const char *iter,
         }
     } else if (e->type == clast_expr_red) {
         r = (struct clast_reduction *)e;
-        for (i=0; i< r->n; i++) {
+        for (i=0; i<r->n; i++) {
             replace_iter_in_expr(r->elts[i], iter, uf, NULL);
         }
     } else {
@@ -2242,8 +2242,7 @@ static struct clast_stmt **get_statements_to_be_unrolled(struct clast_stmt *s,
     return unroll_stmts;
 }
 
-/* Unroll jams a statement. Current supports unroll jam of a single statement as
- * opposed to a statement block. */
+/* Unroll jams a statement. */
 static void unroll_jam_statement(struct clast_stmt *s, unsigned ufactor,
         const char *uj_iterator, cloog_int_t stride)
 {
@@ -2359,7 +2358,7 @@ static void unroll_jam_loop(struct clast_stmt *s)
 
 /* Recursively checks whether an expression e contains the string given by
  * iterator. Returns true if iterator is present. Else returns false. */
-static int does_expr_contain(struct clast_expr *e, const char* iterator)
+static int does_expr_contains(struct clast_expr *e, const char* iterator)
 {
     struct clast_name *n;
     struct clast_term *t;
@@ -2374,17 +2373,17 @@ static int does_expr_contain(struct clast_expr *e, const char* iterator)
     }
     if (e->type == clast_expr_term) {
         t = (struct clast_term *)e;
-        return does_expr_contain(t->var, iterator);
+        return does_expr_contains(t->var, iterator);
     }
     if (e->type == clast_expr_bin) {
         b = (struct clast_binary *)e;
-        return does_expr_contain(b->LHS, iterator);
+        return does_expr_contains(b->LHS, iterator);
     }
     /* This has to be a reduction type. */
     assert (e->type == clast_expr_red);
     r = (struct clast_reduction *)e;
     for (i=0; i<r->n; i++) {
-        if (does_expr_contain(r->elts[i], iterator))
+        if (does_expr_contains(r->elts[i], iterator))
             return 1;
     }
     return 0;
@@ -2392,10 +2391,10 @@ static int does_expr_contain(struct clast_expr *e, const char* iterator)
 
 /* Checks whether the LHS or RHS of on equation containts the string given
  * by iterator. Returns 1 if the string is present else returns 0. */
-static int does_equation_contain(struct clast_equation *e, const char *iterator)
+static int does_equation_contains(struct clast_equation *e, const char *iterator)
 {
-    return (does_expr_contain(e->LHS, iterator) ||
-            does_expr_contain(e->RHS, iterator));
+    return (does_expr_contains(e->LHS, iterator) ||
+            does_expr_contains(e->RHS, iterator));
 }
 
 /* Checks if a loop body is rectangular. Given a loop with iterator "iterator",
@@ -2403,7 +2402,7 @@ static int does_equation_contain(struct clast_equation *e, const char *iterator)
  * conditional with "iterator" in its expression. That is, iterator of the loop
  * that is being unroll jammed shouldnt appear in the loop bounds or the guard
  * statements. If yes, then it returns true.  Else returns false. */
-static int is_domain_rectangular (struct clast_stmt *s, const char *iterator)
+static int is_domain_rectangular(struct clast_stmt *s, const char *iterator)
 {
     struct clast_for *loop;
     struct clast_guard *g;
@@ -2415,9 +2414,9 @@ static int is_domain_rectangular (struct clast_stmt *s, const char *iterator)
         return is_domain_rectangular(s->next, iterator);
     if (CLAST_STMT_IS_A(s, stmt_for)) {
         loop = (struct clast_for*)s;
-        if(does_expr_contain(loop->LB, iterator))
+        if(does_expr_contains(loop->LB, iterator))
             return 0;
-        if(does_expr_contain(loop->UB, iterator))
+        if(does_expr_contains(loop->UB, iterator))
             return 0;
         if (!is_domain_rectangular(loop->body, iterator))
             return 0;
@@ -2427,8 +2426,8 @@ static int is_domain_rectangular (struct clast_stmt *s, const char *iterator)
     assert(CLAST_STMT_IS_A(s, stmt_guard));
     g = (struct clast_guard *)s;
     for (int i=0; i<g->n; i++) {
-        if (does_equation_contain(&g->eq[i], iterator)
-                || does_equation_contain(&g->eq[i], iterator))
+        if (does_equation_contains(&g->eq[i], iterator)
+                || does_equation_contains(&g->eq[i], iterator))
             return 0;
     }
     if (!is_domain_rectangular(g->then, iterator))
@@ -2437,7 +2436,7 @@ static int is_domain_rectangular (struct clast_stmt *s, const char *iterator)
 }
 
 /* Routine recursives traverses the AST in a top down manner and unroll jams for
- * loops that are marked with CLAST_UNROLL_JAM if the domain is rectangluar with
+ * loops that are marked with clast_unroll_and_jam if the domain is rectangluar with
  * respect to the loop that is being unroll jammed.   */
 static void unroll_jam (struct clast_stmt *s, struct clast_stmt *prev)
 {
@@ -2452,9 +2451,9 @@ static void unroll_jam (struct clast_stmt *s, struct clast_stmt *prev)
         unroll_jam (s, prev);
     } else if (CLAST_STMT_IS_A(s, stmt_for)) {
         loop = (struct clast_for*) s;
-        if (loop->unroll == CLAST_UNROLL_JAM) {
+        if (loop->unroll_type == clast_unroll_and_jam) {
             if (!is_domain_rectangular(loop->body, loop->iterator)) {
-                loop->unroll = CLAST_UNROLL_NOT;
+                loop->unroll_type = clast_no_unroll;
                 unroll_jam (loop->body, s);
                 prev = s;
                 s = s->next;
@@ -2512,7 +2511,7 @@ static struct clast_for *clast_for_copy (struct clast_for *f)
     new_for = new_clast_for(f->domain, new_iterator, lb, ub, NULL);
     cloog_int_set(new_for->stride, f->stride);
     new_for->parallel = f->parallel;
-    new_for->unroll = f->unroll;
+    new_for->unroll_type = f->unroll_type;
     new_for->ufactor = f->ufactor;
     new_for->private_vars = clast_str_dup(f->private_vars);
     new_for->reduction_vars = clast_str_dup(f->reduction_vars);

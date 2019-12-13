@@ -37,9 +37,6 @@ struct clast_term {
 #define CLAST_PARALLEL_VEC 4
 #define CLAST_PARALLEL_USER 8
 
-#define CLAST_UNROLL_NOT 0
-#define CLAST_UNROLL 1
-#define CLAST_UNROLL_JAM 2
 enum clast_red_type { clast_red_sum, clast_red_min, clast_red_max };
 struct clast_reduction {
     struct clast_expr	expr;
@@ -99,6 +96,7 @@ struct clast_user_stmt {
     struct clast_stmt *	substitutions;
 };
 
+enum clast_unroll_type {clast_no_unroll, clast_unroll, clast_unroll_and_jam};
 struct clast_for {
     struct clast_stmt	stmt;
     CloogDomain *	domain;
@@ -108,8 +106,8 @@ struct clast_for {
     cloog_int_t		stride;
     struct clast_stmt *	body;
     int parallel;
-    int unroll;
-    int ufactor;
+    enum clast_unroll_type unroll_type;
+    unsigned ufactor;
     /* Comma separated list of loop private variables for OpenMP parallelization */
     char *private_vars;
     /* Comma separated list of reduction variable/operators for OpenMP parallelization */
