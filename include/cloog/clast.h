@@ -96,6 +96,7 @@ struct clast_user_stmt {
     struct clast_stmt *	substitutions;
 };
 
+enum clast_unroll_type {clast_no_unroll, clast_unroll, clast_unroll_and_jam};
 struct clast_for {
     struct clast_stmt	stmt;
     CloogDomain *	domain;
@@ -105,6 +106,8 @@ struct clast_for {
     cloog_int_t		stride;
     struct clast_stmt *	body;
     int parallel;
+    enum clast_unroll_type unroll_type;
+    unsigned ufactor;
     /* Comma separated list of loop private variables for OpenMP parallelization */
     char *private_vars;
     /* Comma separated list of reduction variable/operators for OpenMP parallelization */
@@ -151,6 +154,7 @@ struct clast_for *new_clast_for(CloogDomain *domain, const char *it,
                                 struct clast_expr *LB, struct clast_expr *UB,
                                 CloogStride *stride);
 struct clast_guard *new_clast_guard(int n);
+void clast_unroll_jam(struct clast_stmt *s);
 
 void free_clast_name(struct clast_name *t);
 void free_clast_term(struct clast_term *t);
