@@ -185,12 +185,12 @@ doc:
 # *                                   Doc                                     *
 # *****************************************************************************/
 
-if HAVE_TEXI2DVI
-pdf_DATA = doc/cloog.pdf
-dist_pdf_DATA = doc/cloog.pdf
-doc/cloog.pdf: doc/cloog.texi doc/gitversion.texi
-	$(TEXI2DVI) -I $(top_builddir)/doc --pdf $< -o $@
-endif
+# if HAVE_TEXI2DVI
+# pdf_DATA = doc/cloog.pdf
+# dist_pdf_DATA = doc/cloog.pdf
+# doc/cloog.pdf: doc/cloog.texi doc/gitversion.texi
+# 	$(TEXI2DVI) -I $(top_builddir)/doc --pdf $< -o $@
+# endif
 
 doc/gitversion.texi: @GIT_INDEX@
 	echo '@set VERSION '`$(top_builddir)/genversion.sh`'' > $@
